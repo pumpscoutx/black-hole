@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Gargantua — Black Hole</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #000;
+    }
+    #canvas-container {
+      width: 100%;
+      height: 100%;
+      position: absolute;
+      top: 0;
+      left: 0;
+    }
+    #caption {
+      position: absolute;
+      bottom: 34px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: rgba(255, 255, 255, 0.85);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      font-weight: 300;
+      font-size: 13px;
+      letter-spacing: 0.14em;
+      text-transform: lowercase;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 2.2s cubic-bezier(0.16, 1, 0.3, 1);
+      z-index: 10;
+      white-space: nowrap;
+      text-shadow: 0 2px 12px rgba(0, 0, 0, 0.9);
+    }
+  </style>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.169.0/build/three.module.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="canvas-container"></div>
+  <div id="caption">a black hole, rendered in your browser — 1 HTML file</div>
+
+  <script type="module">
+    import * as THREE from 'three';
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const isRender = urlParams.has('render');
+
+    const container = document.getElementById('canvas-container');
+    const caption = document.getElementById('caption');
+
+    const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+    renderer.setPixelRatio(isRender ? 1 : Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    container.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+    const vertexShader = /* glsl */`
+      out vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = vec4(position, 1.0);
+      }
+    `;
+
+    const fragmentShader = /* glsl */`
+      precision highp float;
+
+      out vec4 fragColor;
+      in vec2 vUv;
+
+      uniform vec2 u_resolution;
+      uniform float u_time;
+      uniform vec3 u_camPos;
+      uniform vec3 u_camForward;
+      uniform vec3 u_camRight;
+      uniform vec3 u_camUp;
+
+      #define PI 3.14159265359
+      #define RS 1.0
+      #define ISCO 3.0
+      #define DISK_OUTER 12.0
+      #define MAX_STEPS 240
+
+      // ACES Tone Mapping
+      vec3 ACESFilm(vec3 x) {
+        float a = 2.51;
+        float b = 0.03;
+        float c = 2.43;
+        float d = 0.59;
+        float e = 0.14;
+        return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+      }
+
+      // Hash utilities
+      float hash21(vec2 p) {
+        p = fract(p * vec2(123.34, 456.21));
+        p += dot(p, p + 45.32);
+        return fract(p.x * p.y);
+      }
+
+      float hash3(vec3 p) {
+        p = fract(p * 0.1031);
+        p += dot(p, p.zyx + 31.32);
+        return fract((p.x + p.y) * p.z);
+      }
+
+      // Smooth 2D Noise
+      float noise2d(vec2 p) {
+        vec2 i = floor(p);
+        vec2 f = fract(p);
+        f = f * f * (3.0 - 2.0 * f);
+
+        float a = hash21(i);
+        float b = hash21(i + vec2(1.0, 0.0));
+        float c = hash21(i + vec2(0.0, 1.0));
+        float d = hash21(i + vec2(1.0, 1.0));
+
+        return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+      }
+
+      // FBM for continuous, non-repeating turbulent streaks
+      float fbmAccretion(vec2 p) {
+        float v = 0.0;
+        float a = 0.5;
+        mat2 rot = mat2(0.8, 0.6, -0.6, 0.8);
+        for (int i = 0; i < 4; i++) {
+          v += a * noise2d(p);
+          p = rot * p * 2.02 + vec2(17.1, 31.4);
+          a *= 0.5;
+        }
+        return v;
+      }
+
+      // Crisp point starfield lensed by gravity well
+      vec3 renderBackground(vec3 dir) {
+        vec3 d = normalize(dir);
+
+        float neb = sin(d.x * 2.5 + d.y * 1.8) * cos(d.z * 2.2);
+        vec3 col = vec3(0.001, 0.0015, 0.003) * (neb * 0.5 + 0.5);
+
+        vec3 p = d * 260.0;
+        vec3 cell = floor(p);
+        float h = hash3(cell);
+
+        if (h > 0.962) {
+          vec3 local = fract(p) - 0.5;
+          float dist = length(local);
+          float intensity = smoothstep(0.35, 0.0, dist);
+          intensity = pow(intensity, 3.8);
+
+          vec3 starColor = mix(vec3(0.7, 0.85, 1.0), vec3(1.0, 0.82, 0.65), hash21(cell.xy));
+          float bright = (h - 0.962) / 0.038;
+          starColor *= (0.35 + 2.8 * pow(bright, 2.5));
+
+          col += starColor * intensity;
+        }
+
+        float fine = pow(hash3(floor(d * 550.0)), 28.0) * 0.45;
+        col += vec3(fine * 0.8, fine * 0.9, fine * 1.0);
+
+        return col;
+      }
+
+      // Gas emission temperature palette
+      vec3 blackbodyPalette(float temp) {
+        vec3 cRed = vec3(1.2, 0.15, 0.01);
+        vec3 cOrange = vec3(2.5, 0.95, 0.12);
+        vec3 cYellow = vec3(3.5, 2.6, 1.1);
+        vec3 cWhite = vec3(4.2, 4.4, 5.0);
+
+        vec3 col = mix(cRed * 0.3, cRed, smoothstep(0.04, 0.25, temp));
+        col = mix(col, cOrange, smoothstep(0.25, 0.65, temp));
+        col = mix(col, cYellow, smoothstep(0.65, 1.25, temp));
+        col = mix(col, cWhite, smoothstep(1.25, 2.2, temp));
+
+        return col;
+      }
+
+      void main() {
+        vec2 uv = (gl_FragCoord.xy - 0.5 * u_resolution.xy) / min(u_resolution.x, u_resolution.y);
+
+        // Ray setup (fovScale zoomed to make disk outer edge span ~90% frame width)
+        float fovScale = 1.42;
+        vec3 rayDir = normalize(u_camForward * fovScale + uv.x * u_camRight + uv.y * u_camUp);
+        vec3 rayPos = u_camPos;
+
+        vec3 accumColor = vec3(0.0);
+        float transmittance = 1.0;
+        bool hitHorizon = false;
+
+        // Geodesic raymarching through curved spacetime
+        for (int i = 0; i < MAX_STEPS; i++) {
+          float r = length(rayPos);
+
+          // Event horizon capture
+          if (r < RS * 1.005) {
+            hitHorizon = true;
+            transmittance = 0.0;
+            break;
+          }
+
+          // Escaped to background space
+          if (r > 38.0 && dot(rayPos, rayDir) > 0.0) {
+            break;
+          }
+
+          // Adaptive step size with smooth jitter dithering to eliminate stepping & moire banding
+          float ds = clamp(0.038 * r, 0.012, 0.32);
+          if (abs(rayPos.y) < 0.45 && r < DISK_OUTER + 1.5) {
+            ds = min(ds, 0.018 + 0.009 * r);
+          }
+          float jitter = hash21(gl_FragCoord.xy + vec2(u_time * 11.7, float(i) * 3.1)) * 0.35 + 0.825;
+          ds *= jitter;
+
+          // Photon ring bloom glow around photon sphere (r ~ 1.5 RS)
+          float photonDist = abs(r - 1.55 * RS);
+          float pGlow = exp(-photonDist * 7.0) * 0.045 * ds;
+          accumColor += vec3(3.2, 2.2, 1.4) * pGlow * transmittance;
+
+          // Plunge region bloom inside ISCO (r = 1.0 to 3.0 RS)
+          if (r > RS && r < ISCO && abs(rayPos.y) < 0.25) {
+            float plunge = (r - RS) / (ISCO - RS);
+            float plungeGlow = exp(-plunge * 3.0) * exp(-abs(rayPos.y) * 14.0);
+            vec3 plungeColor = mix(vec3(4.0, 4.2, 5.0), vec3(3.0, 1.6, 0.4), plunge);
+            accumColor += plungeColor * plungeGlow * 0.16 * ds * transmittance;
+          }
+
+          // Geometrically thin accretion disk sampling
+          float diskHeight = 0.028 * r + 0.004;
+          if (abs(rayPos.y) < diskHeight * 3.8 && r >= ISCO && r < DISK_OUTER) {
+            float yNorm = rayPos.y / diskHeight;
+            float vertDensity = exp(-0.5 * yNorm * yNorm);
+
+            // Radial distribution
+            float radIn = smoothstep(ISCO, ISCO + 0.35, r);
+            float radOut = smoothstep(DISK_OUTER, DISK_OUTER - 3.2, r);
+            float baseDensity = radIn * radOut * pow(ISCO / r, 1.75);
+
+            if (baseDensity > 0.0005) {
+              float phi = atan(rayPos.z, rayPos.x);
+
+              // Differential Keplerian rotation
+              float omega = 2.0 / (r * sqrt(r) + 0.1);
+              float shearedPhi = phi - omega * u_time * 0.85;
+
+              // Fine radial streaks sheared by Keplerian rotation (NO concentric rings)
+              vec2 diskUV1 = vec2(shearedPhi * 5.5, log(r) * 9.0);
+              vec2 diskUV2 = vec2(shearedPhi * 11.0 + u_time * 0.3, r * 2.2);
+
+              float n1 = fbmAccretion(diskUV1);
+              float n2 = noise2d(diskUV2);
+              float turb = mix(n1, n2, 0.28);
+
+              // Relativistic Doppler beaming
+              vec3 velDir = vec3(-sin(phi), 0.0, cos(phi));
+              float beta = clamp(sqrt(0.5 * RS / r), 0.0, 0.58);
+              float gamma = 1.0 / sqrt(1.0 - beta * beta);
+              float cosTheta = dot(velDir, -rayDir);
+              float dopplerFactor = 1.0 / (gamma * (1.0 - beta * cosTheta));
+              float beaming = pow(dopplerFactor, 3.8);
+
+              // Temperature and emission color
+              float temp = pow(ISCO / r, 0.82) * dopplerFactor * (0.55 + 0.75 * turb);
+              vec3 gasColor = blackbodyPalette(temp);
+
+              float stepDensity = baseDensity * vertDensity * (0.35 + 1.15 * turb) * ds * 13.5;
+              float stepTrans = exp(-stepDensity);
+
+              accumColor += gasColor * beaming * (1.0 - stepTrans) * transmittance;
+              transmittance *= stepTrans;
+
+              if (transmittance < 0.005) {
+                break;
+              }
+            }
+          }
+
+          // Schwarzschild geodesic curvature acceleration
+          vec3 hVec = cross(rayPos, rayDir);
+          float h2 = dot(hVec, hVec);
+          float r2 = dot(rayPos, rayPos);
+          float r5 = r2 * r2 * sqrt(r2);
+          vec3 accel = -1.5 * RS * h2 * rayPos / r5;
+
+          // Verlet position and velocity update
+          rayPos += rayDir * ds + 0.5 * accel * ds * ds;
+          rayDir = normalize(rayDir + accel * ds);
+        }
+
+        // Lensed celestial background starfield
+        if (transmittance > 0.005 && !hitHorizon) {
+          vec3 bg = renderBackground(rayDir);
+          accumColor += bg * transmittance;
+        }
+
+        // Tonemapping & Exposure correction with enhanced bloom glow
+        vec3 finalColor = ACESFilm(accumColor * 0.65);
+        finalColor = pow(finalColor, vec3(0.92));
+
+        // Subtle film grain
+        float grain = (hash21(uv * 500.0 + vec2(u_time * 13.0, u_time * 7.0)) - 0.5) * 0.014;
+        finalColor += grain;
+
+        // Subtle vignette
+        float vignette = 1.0 - 0.32 * dot(uv, uv);
+        finalColor *= clamp(vignette, 0.0, 1.0);
+
+        fragColor = vec4(finalColor, 1.0);
+      }
+    `;
+
+    const material = new THREE.ShaderMaterial({
+      vertexShader,
+      fragmentShader,
+      glslVersion: THREE.GLSL3,
+      uniforms: {
+        u_resolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+        u_time: { value: 0.0 },
+        u_camPos: { value: new THREE.Vector3() },
+        u_camForward: { value: new THREE.Vector3() },
+        u_camRight: { value: new THREE.Vector3() },
+        u_camUp: { value: new THREE.Vector3() }
+      },
+      depthWrite: false,
+      depthTest: false
+    });
+
+    const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material);
+    scene.add(quad);
+
+    const camTarget = new THREE.Vector3(0.0, 0.0, 0.0);
+    const worldUp = new THREE.Vector3(0.0, 1.0, 0.0);
+
+    // Camera orbit: elevation strictly between 4deg and 12deg, distance 30 -> 24 rs
+    function updateCamera(t) {
+      const cycle = (t % 15.0) / 15.0;
+      const p = 0.5 - 0.5 * Math.cos(cycle * Math.PI * 2.0);
+
+      // Distance: gentle push in from 30 to 24 Schwarzschild radii
+      const distance = 30.0 - 6.0 * p;
+
+      // Inclination: strictly between 4 deg and 12 deg
+      const degToRad = Math.PI / 180.0;
+      const inclination = (4.0 + 8.0 * p) * degToRad;
+
+      // Slow azimuth orbit
+      const azimuth = t * 0.05;
+
+      const camX = distance * Math.cos(inclination) * Math.sin(azimuth);
+      const camY = distance * Math.sin(inclination);
+      const camZ = distance * Math.cos(inclination) * Math.cos(azimuth);
+
+      const camPos = new THREE.Vector3(camX, camY, camZ);
+      const forward = new THREE.Vector3().subVectors(camTarget, camPos).normalize();
+      const right = new THREE.Vector3().crossVectors(forward, worldUp).normalize();
+      const up = new THREE.Vector3().crossVectors(right, forward).normalize();
+
+      material.uniforms.u_camPos.value.copy(camPos);
+      material.uniforms.u_camForward.value.copy(forward);
+      material.uniforms.u_camRight.value.copy(right);
+      material.uniforms.u_camUp.value.copy(up);
+    }
+
+    // Synchronous deterministic seek
+    window.seek = function(t) {
+      material.uniforms.u_time.value = t;
+      updateCamera(t);
+      renderer.render(scene, camera);
+    };
+
+    // Responsive resize handler
+    function onResize() {
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      renderer.setSize(width, height);
+      material.uniforms.u_resolution.value.set(
+        width * renderer.getPixelRatio(),
+        height * renderer.getPixelRatio()
+      );
+      if (isRender) {
+        window.seek(material.uniforms.u_time.value);
+      }
+    }
+    window.addEventListener('resize', onResize);
+    onResize();
+
+    // Fade in caption after 1s
+    setTimeout(() => {
+      caption.style.opacity = '0.82';
+    }, 1000);
+
+    if (isRender) {
+      // Deterministic render mode driven by window.seek(t)
+      window.seek(0.0);
+      window.renderReady = true;
+    } else {
+      // Real-time interactive loop
+      const startTime = performance.now();
+      function animate() {
+        requestAnimationFrame(animate);
+        const elapsedTime = (performance.now() - startTime) * 0.001;
+        material.uniforms.u_time.value = elapsedTime;
+        updateCamera(elapsedTime);
+        renderer.render(scene, camera);
+      }
+      animate();
+    }
+  </script>
+</body>
+</html>
